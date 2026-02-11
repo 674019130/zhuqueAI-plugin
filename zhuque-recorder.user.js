@@ -1,28 +1,54 @@
 // ==UserScript==
 // @name         朱雀AI检测记录助手
 // @namespace    https://github.com/zhuque-ai-recorder
-// @version      2.0.0
+// @version      2.2.0
 // @description  自动记录朱雀AI检测平台的每次检测结果，包括输入文本、检测百分比、判定结论和时间戳
 // @author       ZhuqueRecorder
 // @match        https://matrix.tencent.com/ai-detect/*
 // @license      MIT
 // @grant        none
-// @run-at       document-idle
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
   'use strict';
 
   const STORAGE_KEY = 'zhuque_detection_records';
+  const _log = console.log.bind(console);
+
+  // ========== WebSocket 拦截（必须在 document-start 执行）==========
+  const OrigWebSocket = window.WebSocket;
+  const wsMessages = []; // 暂存消息，等 UI 初始化后处理
+
+  window.WebSocket = function (...args) {
+    const ws = new OrigWebSocket(...args);
+    const url = args[0] || '';
+    _log('[朱雀记录] WebSocket 创建:', url);
+
+    ws.addEventListener('message', function (event) {
+      try {
+        const raw = typeof event.data === 'string' ? event.data : '';
+        if (!raw || raw.length < 5) return;
+        _log('[朱雀记录] WS消息:', raw.slice(0, 300));
+        wsMessages.push(raw);
+        processMessages();
+      } catch (e) {}
+    });
+
+    return ws;
+  };
+  window.WebSocket.prototype = OrigWebSocket.prototype;
+  window.WebSocket.CONNECTING = OrigWebSocket.CONNECTING;
+  window.WebSocket.OPEN = OrigWebSocket.OPEN;
+  window.WebSocket.CLOSING = OrigWebSocket.CLOSING;
+  window.WebSocket.CLOSED = OrigWebSocket.CLOSED;
 
   // ========== 存储模块 ==========
   const Storage = {
     getRecords() {
       try {
         return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-      } catch {
-        return [];
-      }
+      } catch { return []; }
     },
     saveRecords(records) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(records));
@@ -47,14 +73,12 @@
 
   // ========== 工具函数 ==========
   function generateId() {
-    return 'xxxx-xxxx-xxxx'.replace(/x/g, () =>
-      ((Math.random() * 16) | 0).toString(16)
-    );
+    return 'xxxx-xxxx-xxxx'.replace(/x/g, () => ((Math.random() * 16) | 0).toString(16));
   }
 
   function getInputText() {
-    const textarea = document.querySelector('textarea');
-    return textarea ? textarea.value.trim() : '';
+    const ta = document.querySelector('textarea');
+    return ta ? ta.value.trim() : '';
   }
 
   function truncate(str, len) {
@@ -64,128 +88,194 @@
 
   function formatTime(ts) {
     const d = new Date(ts);
-    const pad = (n) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
   }
 
-  // ========== 检测结果捕获 ==========
-  const Capture = {
-    lastCaptured: null,
-    polling: null,
+  // ========== 消息处理 ==========
+  let lastRecordKey = null;
 
-    // 开始轮询 DOM 等待结果出现
-    startPolling() {
-      if (this.polling) return;
-      let attempts = 0;
-      this.polling = setInterval(() => {
-        attempts++;
-        const result = this.extractFromDOM();
-        if (result) {
-          this.stopPolling();
-          this.handleResult(result);
-        } else if (attempts > 30) {
-          // 60秒超时
-          this.stopPolling();
-        }
-      }, 2000);
-    },
+  function processMessages() {
+    while (wsMessages.length > 0) {
+      const raw = wsMessages.shift();
+      tryExtract(raw);
+    }
+  }
 
-    stopPolling() {
-      if (this.polling) {
-        clearInterval(this.polling);
-        this.polling = null;
-      }
-    },
+  function tryExtract(raw) {
+    let obj = null;
+    try { obj = JSON.parse(raw); } catch {}
 
-    // 从页面可见文本中提取带标签的百分比
-    extractFromDOM() {
-      // 隐藏自身面板再取文本
-      const panel = document.getElementById('zhuque-panel');
-      const floatBtn = document.getElementById('zhuque-float-btn');
-      if (panel) panel.style.visibility = 'hidden';
-      if (floatBtn) floatBtn.style.visibility = 'hidden';
-      const text = document.body.innerText;
-      if (panel) panel.style.visibility = '';
-      if (floatBtn) floatBtn.style.visibility = '';
+    if (!obj) {
+      const m = raw.match(/\{[\s\S]*\}/);
+      if (m) try { obj = JSON.parse(m[0]); } catch {}
+    }
 
-      // 按标签精确匹配
-      const humanMatch = text.match(/人工(?:特征|创作)?[^\d]{0,10}?([\d]+(?:\.[\d]+)?)\s*%/);
-      const suspectMatch = text.match(/疑似\s*AI[^\d]{0,10}?([\d]+(?:\.[\d]+)?)\s*%/);
-      const aiMatch = text.match(/AI\s*(?:特征|生成)?[^\d]{0,10}?([\d]+(?:\.[\d]+)?)\s*%/);
+    if (obj) {
+      _log('[朱雀记录] 解析后的WS数据:', JSON.stringify(obj).slice(0, 500));
 
-      const humanPercent = humanMatch ? parseFloat(humanMatch[1]) : null;
-      const suspectedAIPercent = suspectMatch ? parseFloat(suspectMatch[1]) : null;
-      // AI特征的匹配要排除"疑似AI"的结果
-      let aiPercent = aiMatch ? parseFloat(aiMatch[1]) : null;
-      if (aiPercent !== null && suspectedAIPercent !== null && aiPercent === suspectedAIPercent) {
-        // "AI特征" regex 可能匹配到了 "疑似AI" 的值，尝试再找一个
-        const allAI = [...text.matchAll(/AI\s*(?:特征|生成)?[^\d]{0,10}?([\d]+(?:\.[\d]+)?)\s*%/g)];
-        const distinct = allAI.map(m => parseFloat(m[1])).filter(v => v !== suspectedAIPercent);
-        aiPercent = distinct.length > 0 ? distinct[distinct.length - 1] : null;
+      // 专门处理朱雀 labels_ratio 格式
+      if (obj.status === 'success' && obj.labels_ratio) {
+        const lr = obj.labels_ratio;
+        const toP = (v) => Math.round(parseFloat(v) * 10000) / 100;
+        const result = {
+          humanPercent: lr['0'] !== undefined ? toP(lr['0']) : null,
+          suspectedAIPercent: lr['1'] !== undefined ? toP(lr['1']) : null,
+          aiPercent: lr['2'] !== undefined ? toP(lr['2']) : null,
+          verdict: '',
+        };
+        _log('[朱雀记录] 提取到检测结果:', result);
+        saveResult(result);
+        // 延迟从 DOM 获取判定文本
+        setTimeout(fetchVerdictFromDOM, 1500);
+        return;
       }
 
-      // 至少需要2个有效百分比
-      const validCount = [humanPercent, suspectedAIPercent, aiPercent].filter(v => v !== null).length;
-      if (validCount < 2) return null;
+      const result = deepScan(obj);
+      if (result) {
+        saveResult(result);
+        return;
+      }
+    }
 
-      // 去重键
-      const key = `${humanPercent}-${suspectedAIPercent}-${aiPercent}`;
-      if (this.lastCaptured === key) return null;
+    const textResult = extractFromText(raw);
+    if (textResult) {
+      saveResult(textResult);
+    }
+  }
 
-      // 提取判定文本
+  // 从 DOM 抓取判定文本（如 "未发现明显的人工创作特征"）
+  function fetchVerdictFromDOM() {
+    try {
+      const body = document.body.innerText || '';
+      const patterns = [
+        /未发现明显的[^\n]{0,20}特征/,
+        /发现明显的[^\n]{0,20}特征/,
+        /具有[^\n]{0,20}特征/,
+        /疑似[^\n]{0,20}生成/,
+        /判定[：:]\s*([^\n]+)/,
+      ];
       let verdict = '';
-      const verdictMatch = text.match(/(?:未发现|发现|检测结[果论]|判定)[^\n]{0,50}/);
-      if (verdictMatch) verdict = verdictMatch[0].trim();
-
-      return { humanPercent, suspectedAIPercent, aiPercent, verdict, key };
-    },
-
-    handleResult(result) {
-      this.lastCaptured = result.key;
-      const inputText = getInputText();
-      const record = {
-        id: generateId(),
-        timestamp: new Date().toISOString(),
-        inputText: truncate(inputText, 200),
-        inputTextFull: inputText,
-        verdict: result.verdict,
-        humanPercent: result.humanPercent,
-        suspectedAIPercent: result.suspectedAIPercent,
-        aiPercent: result.aiPercent,
-      };
-      const added = Storage.addRecord(record);
-      if (added) {
-        UI.refreshList();
-        UI.flashButton();
+      for (const p of patterns) {
+        const m = body.match(p);
+        if (m) { verdict = m[0].trim(); break; }
       }
-    },
-
-    reset() {
-      this.lastCaptured = null;
-      this.stopPolling();
-    },
-  };
-
-  // ========== 检测触发监听 ==========
-  function watchTriggers() {
-    // 点击检测按钮
-    document.addEventListener('click', (e) => {
-      const target = e.target;
-      const el = target.closest('button, [role="button"], div, span, a');
-      const text = (el || target).textContent || '';
-      if (/立即检测|开始检测/.test(text)) {
-        Capture.lastCaptured = null;
-        Capture.startPolling();
+      if (verdict) {
+        const records = Storage.getRecords();
+        if (records.length > 0 && !records[0].verdict) {
+          records[0].verdict = verdict;
+          Storage.saveRecords(records);
+          _log('[朱雀记录] 更新判定文本:', verdict);
+          if (UI.panel) UI.refreshList();
+        }
       }
-    }, true);
+    } catch (e) {}
+  }
 
-    // Ctrl+Enter
-    document.addEventListener('keydown', (e) => {
-      if (e.ctrlKey && e.key === 'Enter') {
-        Capture.lastCaptured = null;
-        Capture.startPolling();
+  // 深度扫描 JSON 寻找检测数据
+  function deepScan(obj, depth) {
+    if (!obj || typeof obj !== 'object' || (depth || 0) > 8) return null;
+
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        const r = deepScan(item, (depth || 0) + 1);
+        if (r) return r;
       }
-    }, true);
+      return null;
+    }
+
+    const entries = Object.entries(obj);
+    const nums = entries.filter(([, v]) => {
+      const n = typeof v === 'number' ? v : parseFloat(v);
+      return !isNaN(n) && n >= 0 && n <= 100;
+    });
+
+    if (nums.length >= 2) {
+      const keys = entries.map(([k]) => k).join(' ');
+      if (/human|ai|machine|artificial|suspect|人工|机器|疑似|score|rate|percent|prob|label|type|feat|character|ratio|concentration/i.test(keys)) {
+        _log('[朱雀记录] 候选数据:', JSON.stringify(obj).slice(0, 300));
+        const r = extractFields(obj);
+        if (r) return r;
+      }
+    }
+
+    for (const [, v] of entries) {
+      if (v && typeof v === 'object') {
+        const r = deepScan(v, (depth || 0) + 1);
+        if (r) return r;
+      }
+    }
+    return null;
+  }
+
+  function extractFields(obj) {
+    const find = (patterns) => {
+      for (const [k, v] of Object.entries(obj)) {
+        for (const p of patterns) {
+          if (p.test(k)) {
+            const n = typeof v === 'number' ? v : parseFloat(v);
+            if (!isNaN(n) && n >= 0 && n <= 100) return n;
+          }
+        }
+      }
+      return null;
+    };
+
+    const hp = find([/human/i, /artificial/i, /manual/i, /人工/, /person/i, /real/i, /origin/i]);
+    const sp = find([/suspect/i, /doubt/i, /疑似/, /maybe/i, /possible/i, /uncertain/i, /mix/i]);
+    const ap = find([/^ai$/i, /^ai[_-]/i, /[_-]ai$/i, /machine/i, /机器/, /robot/i, /generat/i, /aigc/i]);
+
+    if (hp === null && sp === null && ap === null) return null;
+
+    let verdict = '';
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === 'string' && v.length > 2 && v.length < 200 &&
+          /verdict|conclusion|result|judge|判定|结论|label|desc|msg|summary/i.test(k)) {
+        verdict = v;
+        break;
+      }
+    }
+
+    return { humanPercent: hp, suspectedAIPercent: sp, aiPercent: ap, verdict };
+  }
+
+  // 从原始文本提取（如果数据不是标准 JSON）
+  function extractFromText(text) {
+    const hp = text.match(/(?:human|人工)[^\d]{0,20}?([\d]+(?:\.[\d]+)?)/i);
+    const sp = text.match(/(?:suspect|疑似)[^\d]{0,20}?([\d]+(?:\.[\d]+)?)/i);
+    const ap = text.match(/(?:(?:^|[_\s])ai(?:[_\s]|$)|machine|机器|aigc)[^\d]{0,20}?([\d]+(?:\.[\d]+)?)/i);
+
+    const hv = hp ? parseFloat(hp[1]) : null;
+    const sv = sp ? parseFloat(sp[1]) : null;
+    const av = ap ? parseFloat(ap[1]) : null;
+
+    if ([hv, sv, av].filter(v => v !== null).length < 2) return null;
+    return { humanPercent: hv, suspectedAIPercent: sv, aiPercent: av, verdict: '' };
+  }
+
+  function saveResult(data) {
+    const key = `${data.humanPercent}-${data.suspectedAIPercent}-${data.aiPercent}`;
+    if (key === lastRecordKey) return;
+    lastRecordKey = key;
+
+    const inputText = getInputText();
+    const record = {
+      id: generateId(),
+      timestamp: new Date().toISOString(),
+      inputText: truncate(inputText, 200),
+      inputTextFull: inputText,
+      verdict: data.verdict || '',
+      humanPercent: data.humanPercent,
+      suspectedAIPercent: data.suspectedAIPercent,
+      aiPercent: data.aiPercent,
+    };
+
+    _log('[朱雀记录] 保存记录:', record);
+    const added = Storage.addRecord(record);
+    if (added && typeof UI !== 'undefined' && UI.panel) {
+      UI.refreshList();
+      UI.flashButton();
+    }
   }
 
   // ========== UI 模块 ==========
@@ -204,169 +294,62 @@
       const style = document.createElement('style');
       style.textContent = `
         #zhuque-float-btn {
-          position: fixed;
-          bottom: 24px;
-          right: 24px;
-          width: 48px;
-          height: 48px;
-          border-radius: 50%;
-          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-          color: #fff;
-          font-size: 22px;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          cursor: pointer;
-          box-shadow: 0 4px 14px rgba(102, 126, 234, 0.45);
-          z-index: 99999;
-          border: none;
-          transition: transform 0.2s, box-shadow 0.2s;
-          user-select: none;
+          position: fixed; bottom: 24px; right: 24px; width: 48px; height: 48px;
+          border-radius: 50%; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          color: #fff; font-size: 22px; display: flex; align-items: center; justify-content: center;
+          cursor: pointer; box-shadow: 0 4px 14px rgba(102,126,234,0.45); z-index: 99999;
+          border: none; transition: transform 0.2s, box-shadow 0.2s; user-select: none;
         }
-        #zhuque-float-btn:hover {
-          transform: scale(1.1);
-          box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
-        }
-        #zhuque-float-btn.flash {
-          animation: zhuque-flash 0.6s ease;
-        }
+        #zhuque-float-btn:hover { transform: scale(1.1); box-shadow: 0 6px 20px rgba(102,126,234,0.6); }
+        #zhuque-float-btn.flash { animation: zhuque-flash 0.6s ease; }
         @keyframes zhuque-flash {
-          0%, 100% { transform: scale(1); }
-          50% { transform: scale(1.3); box-shadow: 0 6px 24px rgba(102, 126, 234, 0.8); }
+          0%,100% { transform: scale(1); }
+          50% { transform: scale(1.3); box-shadow: 0 6px 24px rgba(102,126,234,0.8); }
         }
-
         #zhuque-panel {
-          position: fixed;
-          bottom: 80px;
-          right: 24px;
-          width: 420px;
-          max-height: 520px;
-          background: #fff;
-          border-radius: 12px;
-          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
-          z-index: 99998;
-          display: none;
-          flex-direction: column;
-          overflow: hidden;
+          position: fixed; bottom: 80px; right: 24px; width: 420px; max-height: 520px;
+          background: #fff; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.18);
+          z-index: 99998; display: none; flex-direction: column; overflow: hidden;
           font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         }
         #zhuque-panel.open { display: flex; }
-
         #zhuque-panel-header {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          padding: 14px 18px;
-          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-          color: #fff;
-          cursor: move;
-          user-select: none;
+          display: flex; align-items: center; justify-content: space-between; padding: 14px 18px;
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; cursor: move; user-select: none;
         }
-        #zhuque-panel-header h3 {
-          margin: 0;
-          font-size: 15px;
-          font-weight: 600;
-        }
-        .zhuque-header-actions {
-          display: flex;
-          gap: 8px;
-        }
+        #zhuque-panel-header h3 { margin: 0; font-size: 15px; font-weight: 600; }
+        .zhuque-header-actions { display: flex; gap: 8px; }
         .zhuque-header-actions button {
-          background: rgba(255,255,255,0.2);
-          border: none;
-          color: #fff;
-          border-radius: 6px;
-          padding: 4px 10px;
-          font-size: 12px;
-          cursor: pointer;
-          transition: background 0.2s;
+          background: rgba(255,255,255,0.2); border: none; color: #fff; border-radius: 6px;
+          padding: 4px 10px; font-size: 12px; cursor: pointer; transition: background 0.2s;
         }
-        .zhuque-header-actions button:hover {
-          background: rgba(255,255,255,0.35);
-        }
-
-        #zhuque-records-list {
-          flex: 1;
-          overflow-y: auto;
-          padding: 8px 0;
-        }
-        #zhuque-records-list::-webkit-scrollbar {
-          width: 5px;
-        }
-        #zhuque-records-list::-webkit-scrollbar-thumb {
-          background: #c5c5c5;
-          border-radius: 4px;
-        }
-
+        .zhuque-header-actions button:hover { background: rgba(255,255,255,0.35); }
+        #zhuque-records-list { flex: 1; overflow-y: auto; padding: 8px 0; }
+        #zhuque-records-list::-webkit-scrollbar { width: 5px; }
+        #zhuque-records-list::-webkit-scrollbar-thumb { background: #c5c5c5; border-radius: 4px; }
         .zhuque-record-item {
-          padding: 10px 18px;
-          border-bottom: 1px solid #f0f0f0;
-          font-size: 13px;
-          line-height: 1.5;
-          transition: background 0.15s;
+          padding: 10px 18px; border-bottom: 1px solid #f0f0f0; font-size: 13px;
+          line-height: 1.5; transition: background 0.15s;
         }
-        .zhuque-record-item:hover {
-          background: #f8f9ff;
-        }
-        .zhuque-record-time {
-          color: #999;
-          font-size: 11px;
-          margin-bottom: 4px;
-        }
-        .zhuque-record-text {
-          color: #333;
-          margin-bottom: 6px;
-          word-break: break-all;
-        }
-        .zhuque-record-verdict {
-          color: #764ba2;
-          font-weight: 500;
-          margin-bottom: 4px;
-        }
-        .zhuque-record-percents {
-          display: flex;
-          gap: 12px;
-        }
+        .zhuque-record-item:hover { background: #f8f9ff; }
+        .zhuque-record-time { color: #999; font-size: 11px; margin-bottom: 4px; }
+        .zhuque-record-text { color: #333; margin-bottom: 6px; word-break: break-all; }
+        .zhuque-record-verdict { color: #764ba2; font-weight: 500; margin-bottom: 4px; }
+        .zhuque-record-percents { display: flex; gap: 12px; }
         .zhuque-percent-tag {
-          display: inline-flex;
-          align-items: center;
-          gap: 3px;
-          padding: 2px 8px;
-          border-radius: 10px;
-          font-size: 12px;
-          font-weight: 500;
+          display: inline-flex; align-items: center; gap: 3px; padding: 2px 8px;
+          border-radius: 10px; font-size: 12px; font-weight: 500;
         }
-        .zhuque-tag-human {
-          background: #e8f5e9;
-          color: #2e7d32;
-        }
-        .zhuque-tag-suspect {
-          background: #fff3e0;
-          color: #e65100;
-        }
-        .zhuque-tag-ai {
-          background: #fce4ec;
-          color: #c62828;
-        }
-
-        .zhuque-empty {
-          padding: 40px 20px;
-          text-align: center;
-          color: #aaa;
-          font-size: 14px;
-        }
-
+        .zhuque-tag-human { background: #e8f5e9; color: #2e7d32; }
+        .zhuque-tag-suspect { background: #fff3e0; color: #e65100; }
+        .zhuque-tag-ai { background: #fce4ec; color: #c62828; }
+        .zhuque-empty { padding: 40px 20px; text-align: center; color: #aaa; font-size: 14px; }
         #zhuque-panel-footer {
-          padding: 10px 18px;
-          border-top: 1px solid #f0f0f0;
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          font-size: 12px;
-          color: #999;
+          padding: 10px 18px; border-top: 1px solid #f0f0f0; display: flex;
+          align-items: center; justify-content: space-between; font-size: 12px; color: #999;
         }
       `;
-      document.head.appendChild(style);
+      (document.head || document.documentElement).appendChild(style);
     },
 
     createButton() {
@@ -386,15 +369,13 @@
         <div id="zhuque-panel-header">
           <h3>\u6731\u96C0\u68C0\u6D4B\u8BB0\u5F55</h3>
           <div class="zhuque-header-actions">
-            <button id="zhuque-export-btn" title="\u5BFC\u51FAJSON">\u5BFC\u51FA</button>
-            <button id="zhuque-clear-btn" title="\u6E05\u7A7A\u8BB0\u5F55">\u6E05\u7A7A</button>
-            <button id="zhuque-close-btn" title="\u5173\u95ED">&times;</button>
+            <button id="zhuque-export-btn">\u5BFC\u51FA</button>
+            <button id="zhuque-clear-btn">\u6E05\u7A7A</button>
+            <button id="zhuque-close-btn">&times;</button>
           </div>
         </div>
         <div id="zhuque-records-list"></div>
-        <div id="zhuque-panel-footer">
-          <span id="zhuque-count">\u5171 0 \u6761\u8BB0\u5F55</span>
-        </div>
+        <div id="zhuque-panel-footer"><span id="zhuque-count">\u5171 0 \u6761\u8BB0\u5F55</span></div>
       `;
       document.body.appendChild(panel);
       this.panel = panel;
@@ -403,12 +384,11 @@
       document.getElementById('zhuque-clear-btn').addEventListener('click', () => {
         if (confirm('\u786E\u5B9A\u6E05\u7A7A\u6240\u6709\u68C0\u6D4B\u8BB0\u5F55\u5417\uFF1F')) {
           Storage.clear();
-          Capture.reset();
+          lastRecordKey = null;
           this.refreshList();
         }
       });
       document.getElementById('zhuque-export-btn').addEventListener('click', () => this.exportJSON());
-
       this.enableDrag(panel, document.getElementById('zhuque-panel-header'));
       this.refreshList();
     },
@@ -430,18 +410,13 @@
       const list = document.getElementById('zhuque-records-list');
       const count = document.getElementById('zhuque-count');
       if (!list) return;
-
       const records = Storage.getRecords();
       count.textContent = '\u5171 ' + records.length + ' \u6761\u8BB0\u5F55';
-
       if (records.length === 0) {
         list.innerHTML = '<div class="zhuque-empty">\u6682\u65E0\u68C0\u6D4B\u8BB0\u5F55<br>\u8FDB\u884CAI\u68C0\u6D4B\u540E\u5C06\u81EA\u52A8\u8BB0\u5F55</div>';
         return;
       }
-
-      list.innerHTML = records
-        .map(
-          (r) => `
+      list.innerHTML = records.map((r) => `
         <div class="zhuque-record-item">
           <div class="zhuque-record-time">${formatTime(r.timestamp)}</div>
           <div class="zhuque-record-text">${this.escapeHtml(r.inputText || '(\u65E0\u6587\u672C)')}</div>
@@ -452,15 +427,13 @@
             ${r.aiPercent !== null ? `<span class="zhuque-percent-tag zhuque-tag-ai">AI ${r.aiPercent}%</span>` : ''}
           </div>
         </div>
-      `
-        )
-        .join('');
+      `).join('');
     },
 
     escapeHtml(str) {
-      const div = document.createElement('div');
-      div.textContent = str;
-      return div.innerHTML;
+      const d = document.createElement('div');
+      d.textContent = str;
+      return d.innerHTML;
     },
 
     exportJSON() {
@@ -476,36 +449,36 @@
     },
 
     enableDrag(panel, handle) {
-      let isDragging = false;
-      let startX, startY, origX, origY;
-
+      let dragging = false, sx, sy, ox, oy;
       handle.addEventListener('mousedown', (e) => {
         if (e.target.tagName === 'BUTTON') return;
-        isDragging = true;
-        startX = e.clientX;
-        startY = e.clientY;
-        const rect = panel.getBoundingClientRect();
-        origX = rect.left;
-        origY = rect.top;
+        dragging = true; sx = e.clientX; sy = e.clientY;
+        const r = panel.getBoundingClientRect(); ox = r.left; oy = r.top;
         e.preventDefault();
       });
-
       document.addEventListener('mousemove', (e) => {
-        if (!isDragging) return;
-        panel.style.left = origX + (e.clientX - startX) + 'px';
-        panel.style.top = origY + (e.clientY - startY) + 'px';
-        panel.style.right = 'auto';
-        panel.style.bottom = 'auto';
+        if (!dragging) return;
+        panel.style.left = ox + (e.clientX - sx) + 'px';
+        panel.style.top = oy + (e.clientY - sy) + 'px';
+        panel.style.right = 'auto'; panel.style.bottom = 'auto';
       });
-
-      document.addEventListener('mouseup', () => {
-        isDragging = false;
-      });
+      document.addEventListener('mouseup', () => { dragging = false; });
     },
   };
 
   // ========== 初始化 ==========
-  UI.init();
-  watchTriggers();
-  console.log('[朱雀记录] v2.0.0 已加载');
+  const initUI = () => {
+    if (document.body) {
+      UI.init();
+      processMessages(); // 处理 UI 初始化前暂存的消息
+    } else {
+      document.addEventListener('DOMContentLoaded', () => {
+        UI.init();
+        processMessages();
+      });
+    }
+  };
+  initUI();
+
+  _log('[朱雀记录] v2.2.0 已加载 (WebSocket拦截模式)');
 })();
