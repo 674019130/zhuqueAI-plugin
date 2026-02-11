@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         朱雀AI检测记录助手
 // @namespace    https://github.com/zhuque-ai-recorder
-// @version      2.3.0
+// @version      2.3.1
 // @description  自动记录朱雀AI检测平台的每次检测结果，包括输入文本、检测百分比、判定结论和时间戳
 // @author       ZhuqueRecorder
 // @match        https://matrix.tencent.com/ai-detect/*
@@ -525,5 +525,5 @@
   };
   initUI();
 
-  _log('[朱雀记录] v2.3.0 已加载 (WebSocket拦截模式)');
+  _log('[朱雀记录] v2.3.1 已加载 (WebSocket拦截模式)');
 })();
