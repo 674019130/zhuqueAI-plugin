@@ -1,27 +1,19 @@
 // ==UserScript==
 // @name         朱雀AI检测记录助手
 // @namespace    https://github.com/zhuque-ai-recorder
-// @version      1.3.0
+// @version      2.0.0
 // @description  自动记录朱雀AI检测平台的每次检测结果，包括输入文本、检测百分比、判定结论和时间戳
 // @author       ZhuqueRecorder
 // @match        https://matrix.tencent.com/ai-detect/*
 // @license      MIT
 // @grant        none
-// @run-at       document-start
+// @run-at       document-idle
 // ==/UserScript==
 
 (function () {
   'use strict';
 
   const STORAGE_KEY = 'zhuque_detection_records';
-
-  // 检测激活标志：只有用户真正发起检测后才捕获结果
-  let detectionActive = false;
-
-  // 诊断模式：在控制台输出详细日志，帮助排查问题
-  const DEBUG = true;
-  const _console_log = console.log.bind(console);
-  const log = (...args) => DEBUG && _console_log('[朱雀记录]', ...args);
 
   // ========== 存储模块 ==========
   const Storage = {
@@ -37,10 +29,9 @@
     },
     addRecord(record) {
       const records = this.getRecords();
-      // 去重：同一秒内相同百分比视为重复
       const isDup = records.some(
         (r) =>
-          Math.abs(new Date(r.timestamp) - new Date(record.timestamp)) < 3000 &&
+          Math.abs(new Date(r.timestamp) - new Date(record.timestamp)) < 5000 &&
           r.humanPercent === record.humanPercent &&
           r.aiPercent === record.aiPercent
       );
@@ -62,9 +53,7 @@
   }
 
   function getInputText() {
-    const textarea = document.querySelector(
-      'textarea[placeholder*="检测"], textarea[placeholder*="ctrl+enter"], textarea'
-    );
+    const textarea = document.querySelector('textarea');
     return textarea ? textarea.value.trim() : '';
   }
 
@@ -79,374 +68,125 @@
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   }
 
-  // ========== 记录处理 ==========
-  function buildRecord(data) {
-    const inputText = data.inputText || getInputText();
-    return {
-      id: generateId(),
-      timestamp: new Date().toISOString(),
-      inputText: truncate(inputText, 200),
-      inputTextFull: inputText,
-      verdict: data.verdict || '',
-      humanPercent: data.humanPercent ?? null,
-      suspectedAIPercent: data.suspectedAIPercent ?? null,
-      aiPercent: data.aiPercent ?? null,
-    };
-  }
+  // ========== 检测结果捕获 ==========
+  const Capture = {
+    lastCaptured: null,
+    polling: null,
 
-  function onNewRecord(record) {
-    const added = Storage.addRecord(record);
-    if (added) {
-      log(' 新记录已保存', record);
-      UI.refreshList();
-      UI.flashButton();
-    }
-  }
-
-  // ========== 网络拦截模块 ==========
-  const NetHook = {
-    init() {
-      this.hookFetch();
-      this.hookXHR();
-      this.hookWebSocket();
-    },
-
-    // 深度扫描 JSON 对象，寻找包含数值百分比的检测结果
-    // 策略：遍历所有键值对，寻找至少包含2个 0-100 数值的对象层级
-    scanForDetectionData(obj, depth = 0) {
-      if (!obj || typeof obj !== 'object' || depth > 8) return null;
-
-      if (Array.isArray(obj)) {
-        for (const item of obj) {
-          const found = this.scanForDetectionData(item, depth + 1);
-          if (found) return found;
+    // 开始轮询 DOM 等待结果出现
+    startPolling() {
+      if (this.polling) return;
+      let attempts = 0;
+      this.polling = setInterval(() => {
+        attempts++;
+        const result = this.extractFromDOM();
+        if (result) {
+          this.stopPolling();
+          this.handleResult(result);
+        } else if (attempts > 30) {
+          // 60秒超时
+          this.stopPolling();
         }
-        return null;
-      }
-
-      const entries = Object.entries(obj);
-
-      // 检查当前层级的所有数值，看是否有多个 0-100 范围的浮点数
-      const numericEntries = entries.filter(([, v]) => {
-        const n = typeof v === 'number' ? v : parseFloat(v);
-        return !isNaN(n) && n >= 0 && n <= 100;
-      });
-
-      // 如果有至少2个数值字段且字段名包含检测相关关键词，认为是结果
-      if (numericEntries.length >= 2) {
-        const allKeys = entries.map(([k]) => k).join(' ');
-        const keyStr = allKeys.toLowerCase();
-        // 宽泛匹配：包含任何与检测结果相关的关键词
-        const hasRelevantKey = /human|ai|machine|artificial|suspect|manual|人工|机器|疑似|score|rate|ratio|percent|prob|label|tag|type|category|feat|character/i.test(allKeys);
-        if (hasRelevantKey) {
-          log(' 在API响应中发现候选数据:', JSON.stringify(obj).slice(0, 500));
-          return this.extractResult(obj);
-        }
-      }
-
-      // 递归搜索所有子对象
-      for (const [, val] of entries) {
-        if (val && typeof val === 'object') {
-          const found = this.scanForDetectionData(val, depth + 1);
-          if (found) return found;
-        }
-      }
-
-      return null;
+      }, 2000);
     },
 
-    extractResult(obj) {
-      const entries = Object.entries(obj);
-
-      // 按优先级尝试提取三项百分比
-      const findVal = (patterns) => {
-        for (const [key, val] of entries) {
-          const k = key.toLowerCase();
-          for (const p of patterns) {
-            const matched = p instanceof RegExp ? p.test(key) : k.includes(p.toLowerCase());
-            if (matched) {
-              const n = typeof val === 'number' ? val : parseFloat(val);
-              if (!isNaN(n) && n >= 0 && n <= 100) return n;
-              if (typeof val === 'object' && val !== null) {
-                for (const sub of ['percent', 'value', 'score', 'rate', 'ratio', 'prob']) {
-                  if (val[sub] !== undefined) return parseFloat(val[sub]);
-                }
-              }
-            }
-          }
-        }
-        return null;
-      };
-
-      const humanPercent = findVal([/human/i, /artificial/i, /manual/i, /人工/, /person/i, /real/i, /origin/i]);
-      const suspectedAIPercent = findVal([/suspect/i, /doubt/i, /疑似/, /maybe/i, /possible/i, /uncertain/i, /mix/i]);
-      const aiPercent = findVal([/^ai$/i, /^ai[_-]/i, /[_-]ai$/i, /machine/i, /机器/, /robot/i, /generat/i, /aigc/i]);
-
-      if (humanPercent === null && suspectedAIPercent === null && aiPercent === null) return null;
-
-      // 提取判定/结论文本
-      let verdict = '';
-      for (const [key, val] of entries) {
-        if (typeof val === 'string' && val.length > 2 && val.length < 200) {
-          if (/verdict|conclusion|result|judge|判定|结论|label|desc|message|msg|text|summary|comment/i.test(key)) {
-            verdict = val;
-            break;
-          }
-        }
-      }
-
-      log(' 提取结果:', { humanPercent, suspectedAIPercent, aiPercent, verdict });
-      return { humanPercent, suspectedAIPercent, aiPercent, verdict };
-    },
-
-    // 尝试解析响应文本，支持 JSON 和加密后包含 JSON 片段的情况
-    tryParseResponse(text) {
-      // 先尝试直接解析 JSON
-      try {
-        return JSON.parse(text);
-      } catch {}
-
-      // 尝试查找响应文本中的 JSON 子串
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        try {
-          return JSON.parse(jsonMatch[0]);
-        } catch {}
-      }
-      return null;
-    },
-
-    hookWebSocket() {
-      const OrigWebSocket = window.WebSocket;
-      const self = this;
-
-      window.WebSocket = function (...args) {
-        const ws = new OrigWebSocket(...args);
-        log('WebSocket 连接:', args[0]);
-
-        ws.addEventListener('message', (event) => {
-          try {
-            const raw = typeof event.data === 'string' ? event.data : '';
-            if (!raw || raw.length < 10) return;
-
-            log('WebSocket 消息 (前200字):', raw.slice(0, 200));
-
-            const json = self.tryParseResponse(raw);
-            if (json) {
-              const data = self.scanForDetectionData(json);
-              if (data) {
-                log('WebSocket 中发现检测结果!');
-                detectionActive = false;
-                onNewRecord(buildRecord(data));
-              }
-            }
-          } catch (e) {
-            // 忽略解析错误
-          }
-        });
-
-        return ws;
-      };
-
-      // 保留原型链
-      window.WebSocket.prototype = OrigWebSocket.prototype;
-      window.WebSocket.CONNECTING = OrigWebSocket.CONNECTING;
-      window.WebSocket.OPEN = OrigWebSocket.OPEN;
-      window.WebSocket.CLOSING = OrigWebSocket.CLOSING;
-      window.WebSocket.CLOSED = OrigWebSocket.CLOSED;
-    },
-
-    hookFetch() {
-      const origFetch = window.fetch;
-      window.fetch = function (...args) {
-        return origFetch.apply(this, args).then((response) => {
-          // 拦截所有来自同域或腾讯域名的请求
-          const url = response.url || '';
-          if (/matrix\.tencent\.com|tencent\.com|qq\.com/i.test(url)) {
-            const cloned = response.clone();
-            cloned.text().then((text) => {
-              if (!text || text.length < 10) return;
-              const json = NetHook.tryParseResponse(text);
-              if (!json) return;
-              log(' fetch响应:', url.slice(0, 100), typeof json);
-              const data = NetHook.scanForDetectionData(json);
-              if (data) {
-                detectionActive = false;
-                onNewRecord(buildRecord(data));
-              }
-            }).catch(() => {});
-          }
-          return response;
-        });
-      };
-    },
-
-    hookXHR() {
-      const origOpen = XMLHttpRequest.prototype.open;
-      const origSend = XMLHttpRequest.prototype.send;
-
-      XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-        this._zhuqueUrl = url;
-        return origOpen.call(this, method, url, ...rest);
-      };
-
-      XMLHttpRequest.prototype.send = function (...args) {
-        const url = this._zhuqueUrl || '';
-        if (/matrix\.tencent\.com|tencent\.com|qq\.com/i.test(url)) {
-          this.addEventListener('load', function () {
-            try {
-              const json = NetHook.tryParseResponse(this.responseText);
-              if (!json) return;
-              log(' XHR响应:', url.slice(0, 100), typeof json);
-              const data = NetHook.scanForDetectionData(json);
-              if (data) {
-                detectionActive = false;
-                onNewRecord(buildRecord(data));
-              }
-            } catch {}
-          });
-        }
-        return origSend.apply(this, args);
-      };
-    },
-  };
-
-  // ========== DOM 监听模块 ==========
-  const DomWatcher = {
-    lastValues: null,
-
-    init() {
-      const startWatch = () => {
-        // 监听检测按钮点击，激活捕获
-        this.watchDetectButton();
-
-        const observer = new MutationObserver(() => this.check());
-        observer.observe(document.body, {
-          childList: true,
-          subtree: true,
-          characterData: true,
-        });
-
-        // 定时轮询备用：每2秒检查一次（防止 MutationObserver 漏掉框架更新）
-        setInterval(() => {
-          if (detectionActive) {
-            log('定时轮询触发 check');
-            this.check();
-          }
-        }, 2000);
-      };
-
-      if (document.body) {
-        startWatch();
-      } else {
-        document.addEventListener('DOMContentLoaded', startWatch);
+    stopPolling() {
+      if (this.polling) {
+        clearInterval(this.polling);
+        this.polling = null;
       }
     },
 
-    // 监听页面上的检测按钮和 Ctrl+Enter 快捷键
-    watchDetectButton() {
-      // 点击检测按钮
-      document.addEventListener('click', (e) => {
-        const target = e.target;
-        const btn = target.closest('button, [role="button"], a, div[class*="btn"], span[class*="btn"], div[class*="submit"], div[class*="detect"]');
-        const text = (btn || target).textContent || '';
-        if (/检测|detect|submit|提交/i.test(text)) {
-          log(' 检测按钮被点击，激活捕获');
-          detectionActive = true;
-          this.lastValues = null;
-        }
-      }, true);
-
-      // Ctrl+Enter 快捷键提交
-      document.addEventListener('keydown', (e) => {
-        if (e.ctrlKey && e.key === 'Enter') {
-          log(' Ctrl+Enter 触发，激活捕获');
-          detectionActive = true;
-          this.lastValues = null;
-        }
-      }, true);
-    },
-
-    reset() {
-      this.lastValues = null;
-    },
-
-    check() {
-      // 仅在检测激活后才捕获
-      if (!detectionActive) return;
-
-      // 使用 innerText 避免匹配 CSS/HTML 属性中的百分比
+    // 从页面可见文本中提取带标签的百分比
+    extractFromDOM() {
+      // 隐藏自身面板再取文本
       const panel = document.getElementById('zhuque-panel');
-      const btn = document.getElementById('zhuque-float-btn');
-      // 临时隐藏自身面板以排除干扰
-      const panelDisplay = panel ? panel.style.display : '';
-      const btnDisplay = btn ? btn.style.display : '';
-      if (panel) panel.style.display = 'none';
-      if (btn) btn.style.display = 'none';
-      const pageText = document.body.innerText;
-      if (panel) panel.style.display = panelDisplay;
-      if (btn) btn.style.display = btnDisplay;
+      const floatBtn = document.getElementById('zhuque-float-btn');
+      if (panel) panel.style.visibility = 'hidden';
+      if (floatBtn) floatBtn.style.visibility = 'hidden';
+      const text = document.body.innerText;
+      if (panel) panel.style.visibility = '';
+      if (floatBtn) floatBtn.style.visibility = '';
 
-      // 输出页面文本中包含百分比的行，用于诊断
-      const percentLines = pageText.split('\n').filter(l => /[\d.]+\s*%/.test(l));
-      if (percentLines.length > 0) {
-        log('DOM中包含百分比的行:', percentLines.slice(0, 10));
+      // 按标签精确匹配
+      const humanMatch = text.match(/人工(?:特征|创作)?[^\d]{0,10}?([\d]+(?:\.[\d]+)?)\s*%/);
+      const suspectMatch = text.match(/疑似\s*AI[^\d]{0,10}?([\d]+(?:\.[\d]+)?)\s*%/);
+      const aiMatch = text.match(/AI\s*(?:特征|生成)?[^\d]{0,10}?([\d]+(?:\.[\d]+)?)\s*%/);
+
+      const humanPercent = humanMatch ? parseFloat(humanMatch[1]) : null;
+      const suspectedAIPercent = suspectMatch ? parseFloat(suspectMatch[1]) : null;
+      // AI特征的匹配要排除"疑似AI"的结果
+      let aiPercent = aiMatch ? parseFloat(aiMatch[1]) : null;
+      if (aiPercent !== null && suspectedAIPercent !== null && aiPercent === suspectedAIPercent) {
+        // "AI特征" regex 可能匹配到了 "疑似AI" 的值，尝试再找一个
+        const allAI = [...text.matchAll(/AI\s*(?:特征|生成)?[^\d]{0,10}?([\d]+(?:\.[\d]+)?)\s*%/g)];
+        const distinct = allAI.map(m => parseFloat(m[1])).filter(v => v !== suspectedAIPercent);
+        aiPercent = distinct.length > 0 ? distinct[distinct.length - 1] : null;
       }
 
-      // 精确按标签提取：匹配 "人工特征 XX.XX%" / "疑似AI XX.XX%" / "AI特征 XX.XX%"
-      const labelPatterns = [
-        { key: 'human',    regex: /人工(?:特征)?[^\d]*?([\d]+(?:\.[\d]+)?)\s*%/ },
-        { key: 'suspect',  regex: /疑似\s*AI[^\d]*?([\d]+(?:\.[\d]+)?)\s*%/ },
-        { key: 'ai',       regex: /AI\s*(?:特征)?[^\d]*?([\d]+(?:\.[\d]+)?)\s*%/ },
-      ];
+      // 至少需要2个有效百分比
+      const validCount = [humanPercent, suspectedAIPercent, aiPercent].filter(v => v !== null).length;
+      if (validCount < 2) return null;
 
-      const values = {};
-      for (const { key, regex } of labelPatterns) {
-        const match = pageText.match(regex);
-        if (match) {
-          values[key] = parseFloat(match[1]);
-        }
-      }
-
-      log('DOM标签匹配结果:', values);
-
-      // 需要至少匹配到2个有标签的百分比才视为有效结果
-      const matchCount = Object.keys(values).length;
-      if (matchCount < 2) {
-        log('匹配不足2个，跳过 (匹配数:', matchCount, ')');
-        return;
-      }
-
-      const humanPercent = values.human ?? null;
-      const suspectedAIPercent = values.suspect ?? null;
-      const aiPercent = values.ai ?? null;
-
+      // 去重键
       const key = `${humanPercent}-${suspectedAIPercent}-${aiPercent}`;
-      if (this.lastValues === key) return;
-      this.lastValues = key;
+      if (this.lastCaptured === key) return null;
 
       // 提取判定文本
       let verdict = '';
-      const verdictPatterns = [
-        /未发现[^。\n]*/,
-        /发现[^。\n]*/,
-        /检测结[果论][^。\n]*/,
-        /判定[^。\n]*/,
-      ];
-      for (const pattern of verdictPatterns) {
-        const match = pageText.match(pattern);
-        if (match) {
-          verdict = match[0].trim();
-          break;
-        }
-      }
+      const verdictMatch = text.match(/(?:未发现|发现|检测结[果论]|判定)[^\n]{0,50}/);
+      if (verdictMatch) verdict = verdictMatch[0].trim();
 
-      onNewRecord(
-        buildRecord({ humanPercent, suspectedAIPercent, aiPercent, verdict })
-      );
-      detectionActive = false;
+      return { humanPercent, suspectedAIPercent, aiPercent, verdict, key };
+    },
+
+    handleResult(result) {
+      this.lastCaptured = result.key;
+      const inputText = getInputText();
+      const record = {
+        id: generateId(),
+        timestamp: new Date().toISOString(),
+        inputText: truncate(inputText, 200),
+        inputTextFull: inputText,
+        verdict: result.verdict,
+        humanPercent: result.humanPercent,
+        suspectedAIPercent: result.suspectedAIPercent,
+        aiPercent: result.aiPercent,
+      };
+      const added = Storage.addRecord(record);
+      if (added) {
+        UI.refreshList();
+        UI.flashButton();
+      }
+    },
+
+    reset() {
+      this.lastCaptured = null;
+      this.stopPolling();
     },
   };
+
+  // ========== 检测触发监听 ==========
+  function watchTriggers() {
+    // 点击检测按钮
+    document.addEventListener('click', (e) => {
+      const target = e.target;
+      const el = target.closest('button, [role="button"], div, span, a');
+      const text = (el || target).textContent || '';
+      if (/立即检测|开始检测/.test(text)) {
+        Capture.lastCaptured = null;
+        Capture.startPolling();
+      }
+    }, true);
+
+    // Ctrl+Enter
+    document.addEventListener('keydown', (e) => {
+      if (e.ctrlKey && e.key === 'Enter') {
+        Capture.lastCaptured = null;
+        Capture.startPolling();
+      }
+    }, true);
+  }
 
   // ========== UI 模块 ==========
   const UI = {
@@ -626,67 +366,51 @@
           color: #999;
         }
       `;
-      document.head
-        ? document.head.appendChild(style)
-        : document.addEventListener('DOMContentLoaded', () =>
-            document.head.appendChild(style)
-          );
+      document.head.appendChild(style);
     },
 
     createButton() {
-      const create = () => {
-        const btn = document.createElement('div');
-        btn.id = 'zhuque-float-btn';
-        btn.title = '朱雀检测记录';
-        btn.textContent = '\uD83D\uDCCB';
-        btn.addEventListener('click', () => this.toggle());
-        document.body.appendChild(btn);
-        this.btn = btn;
-      };
-      if (document.body) create();
-      else document.addEventListener('DOMContentLoaded', create);
+      const btn = document.createElement('div');
+      btn.id = 'zhuque-float-btn';
+      btn.title = '\u6731\u96C0\u68C0\u6D4B\u8BB0\u5F55';
+      btn.textContent = '\uD83D\uDCCB';
+      btn.addEventListener('click', () => this.toggle());
+      document.body.appendChild(btn);
+      this.btn = btn;
     },
 
     createPanel() {
-      const create = () => {
-        const panel = document.createElement('div');
-        panel.id = 'zhuque-panel';
-        panel.innerHTML = `
-          <div id="zhuque-panel-header">
-            <h3>朱雀检测记录</h3>
-            <div class="zhuque-header-actions">
-              <button id="zhuque-export-btn" title="导出JSON">导出</button>
-              <button id="zhuque-clear-btn" title="清空记录">清空</button>
-              <button id="zhuque-close-btn" title="关闭">&times;</button>
-            </div>
+      const panel = document.createElement('div');
+      panel.id = 'zhuque-panel';
+      panel.innerHTML = `
+        <div id="zhuque-panel-header">
+          <h3>\u6731\u96C0\u68C0\u6D4B\u8BB0\u5F55</h3>
+          <div class="zhuque-header-actions">
+            <button id="zhuque-export-btn" title="\u5BFC\u51FAJSON">\u5BFC\u51FA</button>
+            <button id="zhuque-clear-btn" title="\u6E05\u7A7A\u8BB0\u5F55">\u6E05\u7A7A</button>
+            <button id="zhuque-close-btn" title="\u5173\u95ED">&times;</button>
           </div>
-          <div id="zhuque-records-list"></div>
-          <div id="zhuque-panel-footer">
-            <span id="zhuque-count">共 0 条记录</span>
-          </div>
-        `;
-        document.body.appendChild(panel);
-        this.panel = panel;
+        </div>
+        <div id="zhuque-records-list"></div>
+        <div id="zhuque-panel-footer">
+          <span id="zhuque-count">\u5171 0 \u6761\u8BB0\u5F55</span>
+        </div>
+      `;
+      document.body.appendChild(panel);
+      this.panel = panel;
 
-        // 事件绑定
-        document.getElementById('zhuque-close-btn').addEventListener('click', () => this.toggle());
-        document.getElementById('zhuque-clear-btn').addEventListener('click', () => {
-          if (confirm('确定清空所有检测记录吗？')) {
-            Storage.clear();
-            DomWatcher.reset();
-            detectionActive = false;
-            this.refreshList();
-          }
-        });
-        document.getElementById('zhuque-export-btn').addEventListener('click', () => this.exportJSON());
+      document.getElementById('zhuque-close-btn').addEventListener('click', () => this.toggle());
+      document.getElementById('zhuque-clear-btn').addEventListener('click', () => {
+        if (confirm('\u786E\u5B9A\u6E05\u7A7A\u6240\u6709\u68C0\u6D4B\u8BB0\u5F55\u5417\uFF1F')) {
+          Storage.clear();
+          Capture.reset();
+          this.refreshList();
+        }
+      });
+      document.getElementById('zhuque-export-btn').addEventListener('click', () => this.exportJSON());
 
-        // 拖拽
-        this.enableDrag(panel, document.getElementById('zhuque-panel-header'));
-
-        this.refreshList();
-      };
-      if (document.body) create();
-      else document.addEventListener('DOMContentLoaded', create);
+      this.enableDrag(panel, document.getElementById('zhuque-panel-header'));
+      this.refreshList();
     },
 
     toggle() {
@@ -698,7 +422,7 @@
     flashButton() {
       if (!this.btn) return;
       this.btn.classList.remove('flash');
-      void this.btn.offsetWidth; // 重置动画
+      void this.btn.offsetWidth;
       this.btn.classList.add('flash');
     },
 
@@ -708,10 +432,10 @@
       if (!list) return;
 
       const records = Storage.getRecords();
-      count.textContent = `共 ${records.length} 条记录`;
+      count.textContent = '\u5171 ' + records.length + ' \u6761\u8BB0\u5F55';
 
       if (records.length === 0) {
-        list.innerHTML = '<div class="zhuque-empty">暂无检测记录<br>进行AI检测后将自动记录</div>';
+        list.innerHTML = '<div class="zhuque-empty">\u6682\u65E0\u68C0\u6D4B\u8BB0\u5F55<br>\u8FDB\u884CAI\u68C0\u6D4B\u540E\u5C06\u81EA\u52A8\u8BB0\u5F55</div>';
         return;
       }
 
@@ -720,11 +444,11 @@
           (r) => `
         <div class="zhuque-record-item">
           <div class="zhuque-record-time">${formatTime(r.timestamp)}</div>
-          <div class="zhuque-record-text">${this.escapeHtml(r.inputText || '(无文本)')}</div>
+          <div class="zhuque-record-text">${this.escapeHtml(r.inputText || '(\u65E0\u6587\u672C)')}</div>
           ${r.verdict ? `<div class="zhuque-record-verdict">${this.escapeHtml(r.verdict)}</div>` : ''}
           <div class="zhuque-record-percents">
-            ${r.humanPercent !== null ? `<span class="zhuque-percent-tag zhuque-tag-human">人工 ${r.humanPercent}%</span>` : ''}
-            ${r.suspectedAIPercent !== null ? `<span class="zhuque-percent-tag zhuque-tag-suspect">疑似AI ${r.suspectedAIPercent}%</span>` : ''}
+            ${r.humanPercent !== null ? `<span class="zhuque-percent-tag zhuque-tag-human">\u4EBA\u5DE5 ${r.humanPercent}%</span>` : ''}
+            ${r.suspectedAIPercent !== null ? `<span class="zhuque-percent-tag zhuque-tag-suspect">\u7591\u4F3CAI ${r.suspectedAIPercent}%</span>` : ''}
             ${r.aiPercent !== null ? `<span class="zhuque-percent-tag zhuque-tag-ai">AI ${r.aiPercent}%</span>` : ''}
           </div>
         </div>
@@ -741,13 +465,8 @@
 
     exportJSON() {
       const records = Storage.getRecords();
-      if (records.length === 0) {
-        alert('没有可导出的记录');
-        return;
-      }
-      const blob = new Blob([JSON.stringify(records, null, 2)], {
-        type: 'application/json',
-      });
+      if (records.length === 0) return;
+      const blob = new Blob([JSON.stringify(records, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -773,10 +492,8 @@
 
       document.addEventListener('mousemove', (e) => {
         if (!isDragging) return;
-        const dx = e.clientX - startX;
-        const dy = e.clientY - startY;
-        panel.style.left = origX + dx + 'px';
-        panel.style.top = origY + dy + 'px';
+        panel.style.left = origX + (e.clientX - startX) + 'px';
+        panel.style.top = origY + (e.clientY - startY) + 'px';
         panel.style.right = 'auto';
         panel.style.bottom = 'auto';
       });
@@ -788,17 +505,7 @@
   };
 
   // ========== 初始化 ==========
-  NetHook.init();
-  DomWatcher.init();
-
-  const initUI = () => {
-    if (document.body) {
-      UI.init();
-    } else {
-      document.addEventListener('DOMContentLoaded', () => UI.init());
-    }
-  };
-  initUI();
-
-  log('脚本已加载 v1.3.0');
+  UI.init();
+  watchTriggers();
+  console.log('[朱雀记录] v2.0.0 已加载');
 })();
