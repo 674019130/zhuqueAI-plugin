@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         朱雀AI检测记录助手
 // @namespace    https://github.com/zhuque-ai-recorder
-// @version      1.2.0
+// @version      1.3.0
 // @description  自动记录朱雀AI检测平台的每次检测结果，包括输入文本、检测百分比、判定结论和时间戳
 // @author       ZhuqueRecorder
 // @match        https://matrix.tencent.com/ai-detect/*
@@ -20,7 +20,8 @@
 
   // 诊断模式：在控制台输出详细日志，帮助排查问题
   const DEBUG = true;
-  const log = (...args) => DEBUG && log('', ...args);
+  const _console_log = console.log.bind(console);
+  const log = (...args) => DEBUG && _console_log('[朱雀记录]', ...args);
 
   // ========== 存储模块 ==========
   const Storage = {
@@ -107,6 +108,7 @@
     init() {
       this.hookFetch();
       this.hookXHR();
+      this.hookWebSocket();
     },
 
     // 深度扫描 JSON 对象，寻找包含数值百分比的检测结果
@@ -212,6 +214,46 @@
         } catch {}
       }
       return null;
+    },
+
+    hookWebSocket() {
+      const OrigWebSocket = window.WebSocket;
+      const self = this;
+
+      window.WebSocket = function (...args) {
+        const ws = new OrigWebSocket(...args);
+        log('WebSocket 连接:', args[0]);
+
+        ws.addEventListener('message', (event) => {
+          try {
+            const raw = typeof event.data === 'string' ? event.data : '';
+            if (!raw || raw.length < 10) return;
+
+            log('WebSocket 消息 (前200字):', raw.slice(0, 200));
+
+            const json = self.tryParseResponse(raw);
+            if (json) {
+              const data = self.scanForDetectionData(json);
+              if (data) {
+                log('WebSocket 中发现检测结果!');
+                detectionActive = false;
+                onNewRecord(buildRecord(data));
+              }
+            }
+          } catch (e) {
+            // 忽略解析错误
+          }
+        });
+
+        return ws;
+      };
+
+      // 保留原型链
+      window.WebSocket.prototype = OrigWebSocket.prototype;
+      window.WebSocket.CONNECTING = OrigWebSocket.CONNECTING;
+      window.WebSocket.OPEN = OrigWebSocket.OPEN;
+      window.WebSocket.CLOSING = OrigWebSocket.CLOSING;
+      window.WebSocket.CLOSED = OrigWebSocket.CLOSED;
     },
 
     hookFetch() {
@@ -758,5 +800,5 @@
   };
   initUI();
 
-  log(' 脚本已加载 v1.2.0');
+  log('脚本已加载 v1.3.0');
 })();
