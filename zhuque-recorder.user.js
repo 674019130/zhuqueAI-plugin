@@ -283,77 +283,59 @@
       this.lastValues = null;
     },
 
-    // 获取页面内容但排除脚本自身的 UI 面板
-    getPageContentExcludingSelf() {
-      const clone = document.body.cloneNode(true);
-      const selfEls = clone.querySelectorAll('#zhuque-panel, #zhuque-float-btn');
-      selfEls.forEach((el) => el.remove());
-      return clone;
-    },
-
     check() {
       // 仅在检测激活后才捕获
       if (!detectionActive) return;
 
-      const pageContent = this.getPageContentExcludingSelf();
+      // 使用 innerText 避免匹配 CSS/HTML 属性中的百分比
+      const panel = document.getElementById('zhuque-panel');
+      const btn = document.getElementById('zhuque-float-btn');
+      // 临时隐藏自身面板以排除干扰
+      const panelDisplay = panel ? panel.style.display : '';
+      const btnDisplay = btn ? btn.style.display : '';
+      if (panel) panel.style.display = 'none';
+      if (btn) btn.style.display = 'none';
+      const pageText = document.body.innerText;
+      if (panel) panel.style.display = panelDisplay;
+      if (btn) btn.style.display = btnDisplay;
 
-      // 从页面 DOM 提取百分比数值（排除自身面板）
-      const percentEls = pageContent.querySelectorAll(
-        '[class*="percent"], [class*="ratio"], [class*="score"], [class*="rate"], [class*="value"], [class*="num"]'
-      );
+      // 精确按标签提取：匹配 "人工特征 XX.XX%" / "疑似AI XX.XX%" / "AI特征 XX.XX%"
+      const labelPatterns = [
+        { key: 'human',    regex: /人工(?:特征)?[^\d]*?([\d]+(?:\.[\d]+)?)\s*%/ },
+        { key: 'suspect',  regex: /疑似\s*AI[^\d]*?([\d]+(?:\.[\d]+)?)\s*%/ },
+        { key: 'ai',       regex: /AI\s*(?:特征)?[^\d]*?([\d]+(?:\.[\d]+)?)\s*%/ },
+      ];
 
-      const percents = [];
-      percentEls.forEach((el) => {
-        const text = el.textContent.trim();
-        const match = text.match(/([\d.]+)\s*%/);
+      const values = {};
+      for (const { key, regex } of labelPatterns) {
+        const match = pageText.match(regex);
         if (match) {
-          percents.push(parseFloat(match[1]));
-        }
-      });
-
-      // 备用：扫描整个结果区域（排除自身面板）
-      if (percents.length < 3) {
-        const allText = pageContent.innerText;
-        const percentRegex = /(?:人工特征|疑似AI|AI特征|人工|疑似|AI)[^\d]*?([\d.]+)\s*%/g;
-        let m;
-        while ((m = percentRegex.exec(allText)) !== null) {
-          percents.push(parseFloat(m[1]));
+          values[key] = parseFloat(match[1]);
         }
       }
 
-      // 进一步备用：找到所有百分比，取最后出现的3个作为结果
-      if (percents.length < 3) {
-        percents.length = 0;
-        const body = pageContent.innerHTML;
-        const allPercents = [...body.matchAll(/([\d]{1,3}\.[\d]{1,2})\s*%/g)].map((m) =>
-          parseFloat(m[1])
-        );
-        const valid = allPercents.filter((v) => v > 0 && v < 100);
-        if (valid.length >= 3) {
-          percents.push(...valid.slice(-3));
-        }
-      }
+      // 需要至少匹配到2个有标签的百分比才视为有效结果
+      const matchCount = Object.keys(values).length;
+      if (matchCount < 2) return;
 
-      if (percents.length < 3) return;
-
-      const [humanPercent, suspectedAIPercent, aiPercent] = percents.slice(0, 3);
+      const humanPercent = values.human ?? null;
+      const suspectedAIPercent = values.suspect ?? null;
+      const aiPercent = values.ai ?? null;
 
       const key = `${humanPercent}-${suspectedAIPercent}-${aiPercent}`;
       if (this.lastValues === key) return;
       this.lastValues = key;
 
-      // 提取判定文本（排除自身面板）
+      // 提取判定文本
       let verdict = '';
       const verdictPatterns = [
         /未发现[^。\n]*/,
         /发现[^。\n]*/,
         /检测结[果论][^。\n]*/,
         /判定[^。\n]*/,
-        /疑似[^。\n]*/,
       ];
-      const bodyText = pageContent.innerText;
       for (const pattern of verdictPatterns) {
-        const match = bodyText.match(pattern);
+        const match = pageText.match(pattern);
         if (match) {
           verdict = match[0].trim();
           break;
