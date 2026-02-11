@@ -5,6 +5,7 @@
 // @description  自动记录朱雀AI检测平台的每次检测结果，包括输入文本、检测百分比、判定结论和时间戳
 // @author       ZhuqueRecorder
 // @match        https://matrix.tencent.com/ai-detect/*
+// @license      MIT
 // @grant        none
 // @run-at       document-start
 // ==/UserScript==
