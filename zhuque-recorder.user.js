@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         朱雀AI检测记录助手
 // @namespace    https://github.com/zhuque-ai-recorder
-// @version      2.3.1
+// @version      2.4.0
 // @description  自动记录朱雀AI检测平台的每次检测结果，包括输入文本、检测百分比、判定结论和时间戳
 // @author       ZhuqueRecorder
 // @match        https://matrix.tencent.com/ai-detect/*
@@ -65,6 +65,20 @@
       records.unshift(record);
       this.saveRecords(records);
       return true;
+    },
+    removeById(id) {
+      const records = this.getRecords().filter(r => r.id !== id);
+      this.saveRecords(records);
+    },
+    toggleStar(id) {
+      const records = this.getRecords();
+      const r = records.find(r => r.id === id);
+      if (r) { r.starred = !r.starred; this.saveRecords(records); }
+    },
+    setNote(id, note) {
+      const records = this.getRecords();
+      const r = records.find(r => r.id === id);
+      if (r) { r.note = note; this.saveRecords(records); }
     },
     clear() {
       localStorage.removeItem(STORAGE_KEY);
@@ -336,7 +350,26 @@
           padding: 10px 14px 10px 18px; border-bottom: 1px solid #f0f0f0; font-size: 13px;
           line-height: 1.5; transition: background 0.15s; border-left: 4px solid transparent;
         }
+        .zhuque-record-item { position: relative; }
         .zhuque-record-item:hover { background: #f8f9ff; }
+        .zhuque-record-actions {
+          position: absolute; top: 8px; right: 8px; display: none; gap: 4px; align-items: center;
+        }
+        .zhuque-record-item:hover .zhuque-record-actions { display: flex; }
+        .zhuque-act-btn {
+          width: 22px; height: 22px; border: none; background: transparent; color: #ccc;
+          font-size: 13px; cursor: pointer; border-radius: 50%; display: flex;
+          align-items: center; justify-content: center; padding: 0; line-height: 1;
+        }
+        .zhuque-act-btn:hover { background: #f0f0f0; color: #666; }
+        .zhuque-act-btn.zhuque-btn-del:hover { background: #fee; color: #e53935; }
+        .zhuque-star-on { color: #f9a825 !important; }
+        .zhuque-record-note {
+          color: #888; font-size: 11px; font-style: italic; margin-top: 4px;
+          padding: 3px 6px; background: #fafafa; border-radius: 4px; word-break: break-all;
+        }
+        .zhuque-record-note-icon { cursor: pointer; }
+        .zhuque-record-note-icon:hover { color: #667eea !important; }
         .zhuque-record-item.zhuque-level-human { border-left-color: #43a047; }
         .zhuque-record-item.zhuque-level-mixed { border-left-color: #ff9800; }
         .zhuque-record-item.zhuque-level-suspect { border-left-color: #ef6c00; }
@@ -410,6 +443,31 @@
         }
       });
       document.getElementById('zhuque-export-btn').addEventListener('click', () => this.exportJSON());
+      // 事件委托：删除、收藏、备注
+      document.getElementById('zhuque-records-list').addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-action]');
+        if (!btn) return;
+        const item = btn.closest('[data-id]');
+        if (!item) return;
+        const id = item.dataset.id;
+        const action = btn.dataset.action;
+        if (action === 'del') {
+          Storage.removeById(id);
+          this.refreshList();
+        } else if (action === 'star') {
+          Storage.toggleStar(id);
+          this.refreshList();
+        } else if (action === 'note') {
+          const records = Storage.getRecords();
+          const r = records.find(r => r.id === id);
+          const current = r ? r.note || '' : '';
+          const note = prompt('\u8F93\u5165\u5907\u6CE8\uFF1A', current);
+          if (note !== null) {
+            Storage.setNote(id, note);
+            this.refreshList();
+          }
+        }
+      });
       this.enableDrag(panel, document.getElementById('zhuque-panel-header'));
       this.refreshList();
     },
@@ -441,19 +499,21 @@
         const h = r.humanPercent || 0;
         const a = r.aiPercent || 0;
         const s = r.suspectedAIPercent || 0;
-        // 整体等级
+        // 整体等级（30%+ 人工率即可视为偏人工）
         let level = 'mixed';
-        if (h >= 70) level = 'human';
+        if (h >= 50) level = 'human';
+        else if (h >= 30 && h >= a) level = 'human';
         else if (a >= 50) level = 'ai';
-        else if (a >= 30 || s >= 50) level = 'suspect';
+        else if (a >= 30) level = 'suspect';
         // 自动判定文本
         let verdict = r.verdict || '';
         if (!verdict) {
           if (h >= 70) verdict = '\u2705 \u4EBA\u5DE5\u521B\u4F5C\u53EF\u80FD\u6027\u5927';
           else if (h >= 50) verdict = '\u2705 \u504F\u5411\u4EBA\u5DE5\u521B\u4F5C';
+          else if (h >= 30) verdict = '\u2705 \u4EBA\u5DE5\u7279\u5F81\u8F83\u660E\u663E';
           else if (a >= 70) verdict = '\u26A0\uFE0F AI\u751F\u6210\u53EF\u80FD\u6027\u5927';
           else if (a >= 50) verdict = '\u26A0\uFE0F \u504F\u5411AI\u751F\u6210';
-          else if (s >= 50) verdict = '\u2753 \u7591\u4F3CAI\u53C2\u4E0E';
+          else if (a >= 30) verdict = '\u2753 \u7591\u4F3CAI\u53C2\u4E0E';
           else verdict = '\u2753 \u4EBA\u673A\u6DF7\u5408';
         }
         const vClass = level === 'human' ? 'zhuque-verdict-human' : level === 'ai' ? 'zhuque-verdict-ai' : 'zhuque-verdict-mixed';
@@ -462,8 +522,13 @@
         const sTag = s >= 50 ? 'high' : s >= 30 ? 'mid' : 'low';
         const aTag = a >= 50 ? 'high' : a >= 30 ? 'mid' : 'low';
         return `
-        <div class="zhuque-record-item zhuque-level-${level}">
-          <div class="zhuque-record-time">${formatTime(r.timestamp)}</div>
+        <div class="zhuque-record-item zhuque-level-${level}" data-id="${r.id}">
+          <div class="zhuque-record-actions">
+            <button class="zhuque-act-btn zhuque-record-note-icon" data-action="note" title="\u5907\u6CE8">\u270F</button>
+            <button class="zhuque-act-btn ${r.starred ? 'zhuque-star-on' : ''}" data-action="star" title="\u6536\u85CF">${r.starred ? '\u2605' : '\u2606'}</button>
+            <button class="zhuque-act-btn zhuque-btn-del" data-action="del" title="\u5220\u9664">\u00D7</button>
+          </div>
+          <div class="zhuque-record-time">${formatTime(r.timestamp)}${r.starred ? ' \u2B50' : ''}</div>
           <div class="zhuque-record-text" title="${this.escapeHtml(r.inputText || '')}">${this.escapeHtml(truncate(r.inputText, 200) || '(\u65E0\u6587\u672C)')}</div>
           <div class="zhuque-record-verdict ${vClass}">${this.escapeHtml(verdict)}</div>
           <div class="zhuque-record-percents">
@@ -471,6 +536,7 @@
             ${r.suspectedAIPercent !== null ? `<span class="zhuque-percent-tag zhuque-tag-suspect-${sTag}">\u7591\u4F3CAI ${r.suspectedAIPercent}%</span>` : ''}
             ${r.aiPercent !== null ? `<span class="zhuque-percent-tag zhuque-tag-ai-${aTag}">AI ${r.aiPercent}%</span>` : ''}
           </div>
+          ${r.note ? `<div class="zhuque-record-note">\uD83D\uDCDD ${this.escapeHtml(r.note)}</div>` : ''}
         </div>`;
       }).join('');
     },
@@ -525,5 +591,5 @@
   };
   initUI();
 
-  _log('[朱雀记录] v2.3.1 已加载 (WebSocket拦截模式)');
+  _log('[朱雀记录] v2.4.0 已加载 (WebSocket拦截模式)');
 })();
