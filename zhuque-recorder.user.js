@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         朱雀AI检测记录助手
 // @namespace    https://github.com/zhuque-ai-recorder
-// @version      1.0.0
+// @version      1.1.0
 // @description  自动记录朱雀AI检测平台的每次检测结果，包括输入文本、检测百分比、判定结论和时间戳
 // @author       ZhuqueRecorder
 // @match        https://matrix.tencent.com/ai-detect/*
@@ -14,6 +14,9 @@
   'use strict';
 
   const STORAGE_KEY = 'zhuque_detection_records';
+
+  // 检测激活标志：只有用户真正发起检测后才捕获结果
+  let detectionActive = false;
 
   // ========== 存储模块 ==========
   const Storage = {
@@ -188,8 +191,12 @@
       const origFetch = window.fetch;
       window.fetch = function (...args) {
         const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+        const isDetectReq = /detect|check|ai-detect|analyse|analyze|verify/i.test(url);
+        if (isDetectReq) {
+          detectionActive = true;
+        }
         return origFetch.apply(this, args).then((response) => {
-          if (/detect|check|ai-detect|analyse|analyze|verify/i.test(url)) {
+          if (isDetectReq) {
             const cloned = response.clone();
             cloned
               .json()
@@ -197,6 +204,7 @@
                 const data = NetHook.parseResponse(url, json);
                 if (data) {
                   onNewRecord(buildRecord(data));
+                  detectionActive = false;
                 }
               })
               .catch(() => {});
@@ -216,13 +224,16 @@
       };
 
       XMLHttpRequest.prototype.send = function (...args) {
-        if (/detect|check|ai-detect|analyse|analyze|verify/i.test(this._zhuqueUrl || '')) {
+        const isDetectReq = /detect|check|ai-detect|analyse|analyze|verify/i.test(this._zhuqueUrl || '');
+        if (isDetectReq) {
+          detectionActive = true;
           this.addEventListener('load', function () {
             try {
               const json = JSON.parse(this.responseText);
               const data = NetHook.parseResponse(this._zhuqueUrl, json);
               if (data) {
                 onNewRecord(buildRecord(data));
+                detectionActive = false;
               }
             } catch {}
           });
@@ -237,8 +248,10 @@
     lastValues: null,
 
     init() {
-      // 等待页面加载完成后开始监听
       const startWatch = () => {
+        // 监听检测按钮点击，激活捕获
+        this.watchDetectButton();
+
         const observer = new MutationObserver(() => this.check());
         observer.observe(document.body, {
           childList: true,
@@ -254,9 +267,38 @@
       }
     },
 
+    // 监听页面上的检测按钮，点击时激活捕获
+    watchDetectButton() {
+      document.addEventListener('click', (e) => {
+        const btn = e.target.closest('button, [role="button"], a');
+        if (btn && /立即检测|开始检测|检测/.test(btn.textContent)) {
+          detectionActive = true;
+          // 重置 lastValues 以允许捕获新结果
+          this.lastValues = null;
+        }
+      }, true);
+    },
+
+    reset() {
+      this.lastValues = null;
+    },
+
+    // 获取页面内容但排除脚本自身的 UI 面板
+    getPageContentExcludingSelf() {
+      const clone = document.body.cloneNode(true);
+      const selfEls = clone.querySelectorAll('#zhuque-panel, #zhuque-float-btn');
+      selfEls.forEach((el) => el.remove());
+      return clone;
+    },
+
     check() {
-      // 从页面 DOM 提取百分比数值
-      const percentEls = document.querySelectorAll(
+      // 仅在检测激活后才捕获
+      if (!detectionActive) return;
+
+      const pageContent = this.getPageContentExcludingSelf();
+
+      // 从页面 DOM 提取百分比数值（排除自身面板）
+      const percentEls = pageContent.querySelectorAll(
         '[class*="percent"], [class*="ratio"], [class*="score"], [class*="rate"], [class*="value"], [class*="num"]'
       );
 
@@ -269,9 +311,9 @@
         }
       });
 
-      // 备用：扫描整个结果区域
+      // 备用：扫描整个结果区域（排除自身面板）
       if (percents.length < 3) {
-        const allText = document.body.innerText;
+        const allText = pageContent.innerText;
         const percentRegex = /(?:人工特征|疑似AI|AI特征|人工|疑似|AI)[^\d]*?([\d.]+)\s*%/g;
         let m;
         while ((m = percentRegex.exec(allText)) !== null) {
@@ -282,28 +324,25 @@
       // 进一步备用：找到所有百分比，取最后出现的3个作为结果
       if (percents.length < 3) {
         percents.length = 0;
-        const body = document.body.innerHTML;
+        const body = pageContent.innerHTML;
         const allPercents = [...body.matchAll(/([\d]{1,3}\.[\d]{1,2})\s*%/g)].map((m) =>
           parseFloat(m[1])
         );
-        // 筛选合理范围
         const valid = allPercents.filter((v) => v > 0 && v < 100);
         if (valid.length >= 3) {
-          // 取最后3个
           percents.push(...valid.slice(-3));
         }
       }
 
       if (percents.length < 3) return;
 
-      // 简单排序检测：假设三个百分比对应人工、疑似AI、AI
       const [humanPercent, suspectedAIPercent, aiPercent] = percents.slice(0, 3);
 
       const key = `${humanPercent}-${suspectedAIPercent}-${aiPercent}`;
       if (this.lastValues === key) return;
       this.lastValues = key;
 
-      // 提取判定文本
+      // 提取判定文本（排除自身面板）
       let verdict = '';
       const verdictPatterns = [
         /未发现[^。\n]*/,
@@ -312,7 +351,7 @@
         /判定[^。\n]*/,
         /疑似[^。\n]*/,
       ];
-      const bodyText = document.body.innerText;
+      const bodyText = pageContent.innerText;
       for (const pattern of verdictPatterns) {
         const match = bodyText.match(pattern);
         if (match) {
@@ -324,6 +363,7 @@
       onNewRecord(
         buildRecord({ humanPercent, suspectedAIPercent, aiPercent, verdict })
       );
+      detectionActive = false;
     },
   };
 
@@ -552,6 +592,8 @@
         document.getElementById('zhuque-clear-btn').addEventListener('click', () => {
           if (confirm('确定清空所有检测记录吗？')) {
             Storage.clear();
+            DomWatcher.reset();
+            detectionActive = false;
             this.refreshList();
           }
         });
