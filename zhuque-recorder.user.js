@@ -268,8 +268,7 @@
     const record = {
       id: generateId(),
       timestamp: new Date().toISOString(),
-      inputText: truncate(inputText, 200),
-      inputTextFull: inputText,
+      inputText: inputText,
       verdict: data.verdict || '',
       humanPercent: data.humanPercent,
       suspectedAIPercent: data.suspectedAIPercent,
@@ -465,7 +464,7 @@
         return `
         <div class="zhuque-record-item zhuque-level-${level}">
           <div class="zhuque-record-time">${formatTime(r.timestamp)}</div>
-          <div class="zhuque-record-text">${this.escapeHtml(r.inputText || '(\u65E0\u6587\u672C)')}</div>
+          <div class="zhuque-record-text" title="${this.escapeHtml(r.inputText || '')}">${this.escapeHtml(truncate(r.inputText, 200) || '(\u65E0\u6587\u672C)')}</div>
           <div class="zhuque-record-verdict ${vClass}">${this.escapeHtml(verdict)}</div>
           <div class="zhuque-record-percents">
             ${r.humanPercent !== null ? `<span class="zhuque-percent-tag zhuque-tag-human-${hTag}">\u4EBA\u5DE5 ${r.humanPercent}%</span>` : ''}
