@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         朱雀AI检测记录助手
 // @namespace    https://github.com/zhuque-ai-recorder
-// @version      2.2.0
+// @version      2.3.0
 // @description  自动记录朱雀AI检测平台的每次检测结果，包括输入文本、检测百分比、判定结论和时间戳
 // @author       ZhuqueRecorder
 // @match        https://matrix.tencent.com/ai-detect/*
@@ -118,15 +118,20 @@
       if (obj.status === 'success' && obj.labels_ratio) {
         const lr = obj.labels_ratio;
         const toP = (v) => Math.round(parseFloat(v) * 10000) / 100;
+        // 从 segment_labels 提取输入文本
+        let wsText = '';
+        if (Array.isArray(obj.segment_labels)) {
+          wsText = obj.segment_labels.map(s => s.text || '').join('');
+        }
         const result = {
           humanPercent: lr['0'] !== undefined ? toP(lr['0']) : null,
           suspectedAIPercent: lr['1'] !== undefined ? toP(lr['1']) : null,
           aiPercent: lr['2'] !== undefined ? toP(lr['2']) : null,
           verdict: '',
+          wsText: wsText,
         };
-        _log('[朱雀记录] 提取到检测结果:', result);
+        _log('[朱雀记录] 提取到检测结果:', JSON.stringify({...result, wsText: truncate(wsText, 50)}));
         saveResult(result);
-        // 延迟从 DOM 获取判定文本
         setTimeout(fetchVerdictFromDOM, 1500);
         return;
       }
@@ -258,7 +263,8 @@
     if (key === lastRecordKey) return;
     lastRecordKey = key;
 
-    const inputText = getInputText();
+    // 优先用 WS 返回的文本，fallback 到 textarea
+    const inputText = data.wsText || getInputText();
     const record = {
       id: generateId(),
       timestamp: new Date().toISOString(),
@@ -328,21 +334,37 @@
         #zhuque-records-list::-webkit-scrollbar { width: 5px; }
         #zhuque-records-list::-webkit-scrollbar-thumb { background: #c5c5c5; border-radius: 4px; }
         .zhuque-record-item {
-          padding: 10px 18px; border-bottom: 1px solid #f0f0f0; font-size: 13px;
-          line-height: 1.5; transition: background 0.15s;
+          padding: 10px 14px 10px 18px; border-bottom: 1px solid #f0f0f0; font-size: 13px;
+          line-height: 1.5; transition: background 0.15s; border-left: 4px solid transparent;
         }
         .zhuque-record-item:hover { background: #f8f9ff; }
+        .zhuque-record-item.zhuque-level-human { border-left-color: #43a047; }
+        .zhuque-record-item.zhuque-level-mixed { border-left-color: #ff9800; }
+        .zhuque-record-item.zhuque-level-suspect { border-left-color: #ef6c00; }
+        .zhuque-record-item.zhuque-level-ai { border-left-color: #e53935; }
         .zhuque-record-time { color: #999; font-size: 11px; margin-bottom: 4px; }
         .zhuque-record-text { color: #333; margin-bottom: 6px; word-break: break-all; }
-        .zhuque-record-verdict { color: #764ba2; font-weight: 500; margin-bottom: 4px; }
-        .zhuque-record-percents { display: flex; gap: 12px; }
+        .zhuque-record-verdict { font-weight: 500; margin-bottom: 4px; font-size: 12px; }
+        .zhuque-verdict-human { color: #2e7d32; }
+        .zhuque-verdict-mixed { color: #e65100; }
+        .zhuque-verdict-ai { color: #c62828; }
+        .zhuque-record-percents { display: flex; gap: 8px; flex-wrap: wrap; }
         .zhuque-percent-tag {
           display: inline-flex; align-items: center; gap: 3px; padding: 2px 8px;
           border-radius: 10px; font-size: 12px; font-weight: 500;
         }
-        .zhuque-tag-human { background: #e8f5e9; color: #2e7d32; }
-        .zhuque-tag-suspect { background: #fff3e0; color: #e65100; }
-        .zhuque-tag-ai { background: #fce4ec; color: #c62828; }
+        /* 人工 - 按等级 */
+        .zhuque-tag-human-high { background: #c8e6c9; color: #1b5e20; }
+        .zhuque-tag-human-mid { background: #e8f5e9; color: #2e7d32; }
+        .zhuque-tag-human-low { background: #f1f8e9; color: #558b2f; }
+        /* 疑似AI - 按等级 */
+        .zhuque-tag-suspect-high { background: #ffe0b2; color: #e65100; }
+        .zhuque-tag-suspect-mid { background: #fff3e0; color: #ef6c00; }
+        .zhuque-tag-suspect-low { background: #fff8e1; color: #ff8f00; }
+        /* AI - 按等级 */
+        .zhuque-tag-ai-high { background: #ffcdd2; color: #b71c1c; }
+        .zhuque-tag-ai-mid { background: #fce4ec; color: #c62828; }
+        .zhuque-tag-ai-low { background: #fff0f0; color: #e53935; }
         .zhuque-empty { padding: 40px 20px; text-align: center; color: #aaa; font-size: 14px; }
         #zhuque-panel-footer {
           padding: 10px 18px; border-top: 1px solid #f0f0f0; display: flex;
@@ -416,18 +438,42 @@
         list.innerHTML = '<div class="zhuque-empty">\u6682\u65E0\u68C0\u6D4B\u8BB0\u5F55<br>\u8FDB\u884CAI\u68C0\u6D4B\u540E\u5C06\u81EA\u52A8\u8BB0\u5F55</div>';
         return;
       }
-      list.innerHTML = records.map((r) => `
-        <div class="zhuque-record-item">
+      list.innerHTML = records.map((r) => {
+        const h = r.humanPercent || 0;
+        const a = r.aiPercent || 0;
+        const s = r.suspectedAIPercent || 0;
+        // 整体等级
+        let level = 'mixed';
+        if (h >= 70) level = 'human';
+        else if (a >= 50) level = 'ai';
+        else if (a >= 30 || s >= 50) level = 'suspect';
+        // 自动判定文本
+        let verdict = r.verdict || '';
+        if (!verdict) {
+          if (h >= 70) verdict = '\u2705 \u4EBA\u5DE5\u521B\u4F5C\u53EF\u80FD\u6027\u5927';
+          else if (h >= 50) verdict = '\u2705 \u504F\u5411\u4EBA\u5DE5\u521B\u4F5C';
+          else if (a >= 70) verdict = '\u26A0\uFE0F AI\u751F\u6210\u53EF\u80FD\u6027\u5927';
+          else if (a >= 50) verdict = '\u26A0\uFE0F \u504F\u5411AI\u751F\u6210';
+          else if (s >= 50) verdict = '\u2753 \u7591\u4F3CAI\u53C2\u4E0E';
+          else verdict = '\u2753 \u4EBA\u673A\u6DF7\u5408';
+        }
+        const vClass = level === 'human' ? 'zhuque-verdict-human' : level === 'ai' ? 'zhuque-verdict-ai' : 'zhuque-verdict-mixed';
+        // tag 等级
+        const hTag = h >= 50 ? 'high' : h >= 30 ? 'mid' : 'low';
+        const sTag = s >= 50 ? 'high' : s >= 30 ? 'mid' : 'low';
+        const aTag = a >= 50 ? 'high' : a >= 30 ? 'mid' : 'low';
+        return `
+        <div class="zhuque-record-item zhuque-level-${level}">
           <div class="zhuque-record-time">${formatTime(r.timestamp)}</div>
           <div class="zhuque-record-text">${this.escapeHtml(r.inputText || '(\u65E0\u6587\u672C)')}</div>
-          ${r.verdict ? `<div class="zhuque-record-verdict">${this.escapeHtml(r.verdict)}</div>` : ''}
+          <div class="zhuque-record-verdict ${vClass}">${this.escapeHtml(verdict)}</div>
           <div class="zhuque-record-percents">
-            ${r.humanPercent !== null ? `<span class="zhuque-percent-tag zhuque-tag-human">\u4EBA\u5DE5 ${r.humanPercent}%</span>` : ''}
-            ${r.suspectedAIPercent !== null ? `<span class="zhuque-percent-tag zhuque-tag-suspect">\u7591\u4F3CAI ${r.suspectedAIPercent}%</span>` : ''}
-            ${r.aiPercent !== null ? `<span class="zhuque-percent-tag zhuque-tag-ai">AI ${r.aiPercent}%</span>` : ''}
+            ${r.humanPercent !== null ? `<span class="zhuque-percent-tag zhuque-tag-human-${hTag}">\u4EBA\u5DE5 ${r.humanPercent}%</span>` : ''}
+            ${r.suspectedAIPercent !== null ? `<span class="zhuque-percent-tag zhuque-tag-suspect-${sTag}">\u7591\u4F3CAI ${r.suspectedAIPercent}%</span>` : ''}
+            ${r.aiPercent !== null ? `<span class="zhuque-percent-tag zhuque-tag-ai-${aTag}">AI ${r.aiPercent}%</span>` : ''}
           </div>
-        </div>
-      `).join('');
+        </div>`;
+      }).join('');
     },
 
     escapeHtml(str) {
@@ -480,5 +526,5 @@
   };
   initUI();
 
-  _log('[朱雀记录] v2.2.0 已加载 (WebSocket拦截模式)');
+  _log('[朱雀记录] v2.3.0 已加载 (WebSocket拦截模式)');
 })();
