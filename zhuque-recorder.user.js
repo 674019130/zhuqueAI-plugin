@@ -139,8 +139,8 @@
         }
         const result = {
           humanPercent: lr['0'] !== undefined ? toP(lr['0']) : null,
-          suspectedAIPercent: lr['1'] !== undefined ? toP(lr['1']) : null,
-          aiPercent: lr['2'] !== undefined ? toP(lr['2']) : null,
+          suspectedAIPercent: lr['2'] !== undefined ? toP(lr['2']) : null,
+          aiPercent: lr['1'] !== undefined ? toP(lr['1']) : null,
           verdict: '',
           wsText: wsText,
         };
